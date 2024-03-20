@@ -1,0 +1,304 @@
+基于optee的可信操作系统（七） optee的smc和线程处理
+
+架构：AARCH64
+
+内核版本：5.14.0-rc5
+
+atf版本：ATF V2.5
+
+optee版本：3.14.0
+
+1　概述
+　　linux可通过smc命令调用optee的安全服务，该命令将首先被发送到bl31，然后由bl31转发给optee。根据任务的不同，optee提供了fast smc和std smc两种命令处理方式，它们的主要区别如下：
+（1）fast smc：optee在执行这类命令时，将会关闭cpu的irq和fiq中断。因此可保证其执行上下文是原子的，但相应地也会影响系统的响应速度和实时性，因此一般被用于执行速度很快的场景中
+
+（2）std smc：optee在执行这类命令时，不会关闭中断。因此在中断处理中可能需要转发normal world的foreign中断，同时在一些服务中可能需要通过rpc操作调用normal world的相关功能。
+
+　　在normal world相关工作执行完成，cpu重新进入optee时，需要能够恢复被中断的上下文，并从断点处继续执行。由于默认情况下，optee的上下文是与cpu core id绑定的，因此若进行不特殊处理，则在cpu通过rpc返回normal world时，其上下文将被保存在其退出时的cpu context中。
+
+　　但rpc流程在normal world中执行时，可能会被其它线程抢占，当其再次被调度回来时该线程又可能被负载均衡到其它的cpu上。从而导致rpc在执行完成返回optee时，其cpu id与触发时的cpu id不同。此时，若std smc恢复为新cpu对应的上下文，显然是错误的。以下为其相应的流程图：
+
+
+　　为了解决该问题，optee为std smc设计了trust 线程机制。该机制为每个相关命令分配一个线程，并使用线程id唯一地标识该线程。此时，若发生rpc操作，则optee可将其上下文保存到与线程绑定的context中。当其返回时只需通过线程号找到并恢复其正确的上下文即可。以下为其相应的流程：
+
+
+　　除此之外，optee还可通过std smc支持pta和ta，其中pta是optee内核向normal world导出的trust接口。它被固定编译在optee内核中，normal world可通过这些接口调用相关的安全服务。与pta不同，ta并不需要与optee链接在一起，而是可以单独编译，单独加载。因此它可以与ca一起，灵活方便地实现各种安全服务。
+
+２　fast smc实现
+　　bl31在接收到linux的smc命令时，首先会解析其对应的service类型，若其为optee类型则进一步解析其smc类型。然后根据其smc类型，分别跳转到optee的fast smc或std smc入口。若其为fast smc命令，则只需根据命令参数，直接调用相关的处理函数即可。以下为其相应的流程：
+
+
+　　其中vector_fast_smc_entry函数的代码实现如下：
+
+LOCAL_FUNC vector_fast_smc_entry , : , .identity_map
+	readjust_pc
+	sub	sp, sp, #THREAD_SMC_ARGS_SIZE
+	store_xregs sp, THREAD_SMC_ARGS_X0, 0, 7            
+	mov	x0, sp                                            （1）
+	bl	thread_handle_fast_smc                            （2）
+	load_xregs sp, THREAD_SMC_ARGS_X0, 1, 8            
+	add	sp, sp, #THREAD_SMC_ARGS_SIZE                     （3）
+	ldr	x0, =TEESMC_OPTEED_RETURN_CALL_DONE               （4）
+	smc	#0                                                （5）
+	panic_at_smc_return
+END_FUNC vector_fast_smc_entry
+（1）将通过x0 – x7寄存器传入的fast smc参数，转换为thread_handle_fast_smc的参数。它是通过将这些参数保存在栈上，然后将栈上的参数起始地址作为函数参数传给thread_handle_fast_smc实现的。对于arm64架构，其参数定义如下：
+
+struct thread_smc_args {
+	uint64_t a0;	/* SMC function ID */
+	uint64_t a1;	/* Parameter */
+	uint64_t a2;	/* Parameter */
+	uint64_t a3;	/* Thread ID when returning from RPC */
+	uint64_t a4;	/* Not used */
+	uint64_t a5;	/* Not used */
+	uint64_t a6;	/* Not used */
+	uint64_t a7;	/* Hypervisor Client ID */
+};
+（2）调用thread_handle_fast_smc执行实际的fast smc命令处理
+
+（3）执行完成后，栈上参数对应的内存将被用于返回相关的结果，因此需要将这些值加载回寄存器中。与入参时不同，它们将被被加载到x1 – x8寄存器中，而x0寄存器将被用于保存step 4中的命令执行状态TEESMC_OPTEED_RETURN_CALL_DONE
+
+（5）通过smc返回bl31，并由bl31返回linux
+
+　　其中thread_handle_fast_smc函数最终会调用__tee_entry_fast函数，以执行实际的fast smc命令。以获取optee api的uuid为例，其代码实现如下：
+
+void __weak tee_entry_get_api_uuid(struct thread_smc_args *args)
+{
+	args->a0 = OPTEE_MSG_UID_0;
+	args->a1 = OPTEE_MSG_UID_1;
+	args->a2 = OPTEE_MSG_UID_2;
+	args->a3 = OPTEE_MSG_UID_3;
+}
+３　std smc实现
+　　与fast smc不同，std smc需要为每条命令创建一个线程，该线程将拥有自己独立的栈和上下文。当其需要通过rpc返回linux或执行suspend操作时，则会将线程相关信息保存在线程上下文中。而当其需要恢复执行时，则可通过线程id找到对应的上下文，并恢复其先前的执行状态。
+
+　　optee线程通过thread_ctx结构体管理其相应的上下文，它主要包括线程的寄存器、栈指针、状态、flags以及其它一些相关的参数。以下为其定义：
+
+struct thread_ctx {
+	struct thread_ctx_regs regs;                       （1）
+	enum thread_state state;                           （2）
+	vaddr_t stack_va_end;                              （3）
+	uint32_t flags;                                    （4）
+	struct core_mmu_user_map user_map;                 （5）
+	bool have_user_map;                                （6）
+#ifdef ARM64
+	vaddr_t kern_sp;	                           （7）
+#endif
+#ifdef CFG_WITH_VFP
+	struct thread_vfp_state vfp_state;
+#endif
+	void *rpc_arg;
+	struct mobj *rpc_mobj;                          
+	struct thread_shm_cache shm_cache;               
+	struct thread_specific_data tsd;                   （8）
+}
+（1）线程的寄存器上下文，在其执行suspend操作时，可将cpu寄存器保存到该结构中。当其resume时，则通过该结构中的值恢复cpu寄存器
+
+（2）线程当前的状态，它包括以下所示的free、suspend和active三种类型。其中free表示该线程结构体当前未被使用，并可分配给新创建的线程，suspend表示线程被暂停执行，在其被resume后可重新投入运行，而active表示线程正在执行。
+
+enum thread_state {
+	THREAD_STATE_FREE,
+	THREAD_STATE_SUSPENDED,
+	THREAD_STATE_ACTIVE,
+}
+（3）该值表示该线程的栈指针，它是在系统初始化时被预分配好的
+
+（4）线程标志
+
+（5）表示当前用户的映射寄存器状态，如ttbr0寄存器的值等
+
+（6）用于表示该线程是否含有用户空间的页表
+
+（7）当TA在用户空间执行时，该变量用于保存其对应的内核空间页表基地址。在其返回内核空间时，即可用该值恢复内核页表
+
+（8）用于保存rpc等相关的参数
+
+３.1　线程初始化
+　　由于optee是与linux并行执行的，若其并发数过多，则可能会眼中影响linux的性能。为此optee提供了一个配置参数CFG_NUM_THREADS，用于控制其同时可运行的线程数量。为此，optee在启动时会初始化这些线程相关的数据结构，以下为其代码实现：
+
+void thread_init_threads(void)
+{
+	size_t n = 0;
+
+	init_thread_stacks();                                      （1）
+	print_stack_limits();              
+	pgt_init();                                                （2）
+
+	mutex_lockdep_init();                                
+
+	for (n = 0; n < CFG_NUM_THREADS; n++) {
+		TAILQ_INIT(&threads[n].tsd.sess_stack);
+		SLIST_INIT(&threads[n].tsd.pgt_cache);             （3）
+	}
+}
+（1）为所有线程分配栈内存
+
+（2）为所有线程分配页表
+
+（3）为所有线程初始化相关的链表
+
+３.2　线程创建和释放流程
+　　Linux在调用std smc命令后，optee将会为其创建一个线程，并最终通过线程调用相关的std处理函数call_entry_std。当该线程执行完成后，将释放其所持有的线程栈等资源，然后将线程状态重设为free，以使其能被后续新建线程复用。以下为相应的流程图：
+
+
+线程创建主函数__thread_alloc_and_run的代码实现如下：
+
+static void __thread_alloc_and_run(uint32_t a0, uint32_t a1, uint32_t a2,
+				   uint32_t a3, uint32_t a4, uint32_t a5,
+				   uint32_t a6, uint32_t a7,
+				   void *pc)
+{
+	size_t n;
+	struct thread_core_local *l = thread_get_core_local();           （1）
+	bool found_thread = false;
+	…
+	for (n = 0; n < CFG_NUM_THREADS; n++) {                          （2）
+		if (threads[n].state == THREAD_STATE_FREE) {
+			threads[n].state = THREAD_STATE_ACTIVE;
+			found_thread = true;
+			break;
+		}
+	}
+	…
+	if (!found_thread)                                               （3）
+		return;
+	l->curr_thread = n;                                              （4）
+
+	threads[n].flags = 0;
+	init_regs(threads + n, a0, a1, a2, a3, a4, a5, a6, a7, pc);      （5）
+	…
+	thread_resume(&threads[n].regs);                                 （6）
+	panic();
+}
+（1）获取该cpu对应的线程上下文指针
+
+（2）从预先分配的线程结构体中，为该线程查找一个空闲的entry
+
+（3）若查找失败，则线程创建失败，并直接返回
+
+（4）将该线程的线程号保存到cpu上下文的curr_thread成员中
+
+（5）初始化线程上下文对应的cpu寄存器，接下来将使用这些寄存器的值初始化线程的执行状态
+
+（6）使用step 5的上下文初始化cpu寄存器，并跳转到由pc指定的新入口中开始执行该线程，其中pc值指向函数thread_std_smc_entry。该函数最终会调用call_entry_std执行实际的std smc命令处理流程
+
+　　当std smc处理完成后，需要将cpu的栈从线程栈切换为与cpu id绑定的tmp_stack，然后通过将线程状态指定为free，以释放线程相关资源。最后它将通过smc异常返回linux内核，完成std smc的执行流程
+
+３.3　线程suspend流程
+　　在std smc的执行过程中可以通过rpc操作返回linux，以请求相关的linux服务。此时需要将线程上下文保存到其对应的栈上，然后将该线程设置为suspend状态。最后为rpc操作设置正确的参数后，通过smc异常返回到linux中。以下为其执行流程：
+
+
+　　其中get_rpc_arg函数的作用是为rpc准备相关的参数，而reg_pair_from_64则是将其参数的物理地址，转换为两个32位的值，以便于通过寄存器传送给linux内核。
+
+　　而thread_rpc函数用于实际的线程上下文保存，以及返回linux工作，以下为其相关的代码实现：
+
+FUNC thread_rpc , :
+	mrs	x1, daif
+	orr	x1, x1, #(SPSR_64_MODE_EL1 << SPSR_64_MODE_EL_SHIFT)
+
+	msr	daifset, #DAIFBIT_ALL                              （1）
+	push	x0, xzr
+	push	x1, x30                                      
+	bl	thread_get_ctx_regs                            
+	ldr	x30, [sp, #8]
+	store_xregs x0, THREAD_CTX_REGS_X19, 19, 30                （2）
+	mov	x19, x0
+
+	bl	thread_get_tmp_sp                                  （3）
+	pop	x1, xzr		
+	mov	x2, sp
+	str	x2, [x19, #THREAD_CTX_REGS_SP]                     （4）
+	ldr	x20, [sp]	                                   （5）
+	mov	sp, x0		                                   （6）
+
+	load_wregs x20, 0, 21, 23	                           （7）
+
+	adr	x2, .thread_rpc_return                             （8）
+	mov	w0, #THREAD_FLAGS_COPY_ARGS_ON_RETURN
+	bl	thread_state_suspend                               （9）
+	mov	x4, x0		                                   （10）
+	ldr	w0, =TEESMC_OPTEED_RETURN_CALL_DONE
+	mov	x1, x21
+	mov	x2, x22
+	mov	x3, x23                                            （11）
+	smc	#0                                                 （12）
+	panic_at_smc_return
+
+.thread_rpc_return:                                                （13）
+	pop	x16, xzr	
+	store_wregs x16, 0, 0, 3	                           （14）
+	ret                                                        （15）
+END_FUNC thread_rpc
+DECLARE_KEEP_PAGER thread_rpc
+（1）由于接下来将要离开线程上下文，cpu需要工作在原子状态，因此需要关闭其中断。故需要设置pstate的daif掩码
+
+（2）将callee寄存器x19 – x30保存线程上下文中
+
+（3）获取与cpu id绑定的临时栈指针，在suspend后cpu将会被切换到临时栈
+
+（4）将线程栈指针保存到线程context中
+
+（5）从栈中获取rpc参数地址
+
+（6）将cpu切换为临时栈
+
+（7）根据x20寄存器的值，从rpc参数地址处加载rpc参数，并保存到w20 – 22寄存器中
+
+（8）加载rpc返回地址，并保存到x2寄存器中
+
+（9）执行线程suspend操作，它会将x0的值THREAD_FLAGS_COPY_ARGS_ON_RETURN保存到context的flags中，将x1的值保存到context的cpsr，并将x2的值.thread_rpc_return保存为pc指针。当线程resume时，将通过这些参数恢复cpu的状态，即线程resume时将从.thread_rpc_return处开始执行
+
+（10）thread_state_suspend将会返回线程id，它将会作为参数通过x4传送给linux。linux在rpc执行完成后会将该值传回给optee，在此后的resume操作中，就是通过该值查找其对应的线程上下文的
+
+（11）通过x0 – x3寄存器设置其它的rpc参数
+
+（12）通过smc返回内核
+
+（13）此时，线程已经通过下节所述resume操作，恢复相关的上下文，并开始继续执行
+
+（14）恢复线程的参数值
+
+（15）通过ret操作，从执行rpc的断点处继续执行
+
+３.4　线程resume流程
+　　线程resume流程比较简单，其主要工作就是判断该smc命令是否为rpc resume命令。若是则获取其thread id，然后找到相应的线程上下文，最后通过线程上下文恢复cpu执行状态。从后线程将会从上节所述的.thread_rpc_return处继续执行，以下为其相应的流程图：
+
+
+其中主函数thread_resume_from_rpc的代码实现如下：
+
+void thread_resume_from_rpc(uint32_t thread_id, uint32_t a0, uint32_t a1,
+			    uint32_t a2, uint32_t a3)
+{
+	size_t n = thread_id;                                                      （1）
+	…
+	if (n < CFG_NUM_THREADS && threads[n].state == THREAD_STATE_SUSPENDED) {
+		threads[n].state = THREAD_STATE_ACTIVE;
+		found_thread = true;                                               （2）
+	}
+
+	thread_unlock_global();
+
+	if (!found_thread)                                                          （3）
+		return;
+
+	l->curr_thread = n;                                                         （4）
+	…
+	if (threads[n].flags & THREAD_FLAGS_COPY_ARGS_ON_RETURN) {
+		copy_a0_to_a3(&threads[n].regs, a0, a1, a2, a3);                    （5）
+		threads[n].flags &= ~THREAD_FLAGS_COPY_ARGS_ON_RETURN;
+	}
+	…
+	thread_resume(&threads[n].regs);                                            （6）       
+	panic();
+}
+（1）获取该rpc操作对应的thread id
+
+（2）若该thread id的值和状态都正确，线程号是合法的，且该线程当前处于suspend状态，则将其修改为active状态。
+
+（3）若线程上下文查找失败，则返回错误
+
+（4）设置该cpu当前对应的线程号
+
+（5）将rpc返回的参数拷贝到对应的线程上下文寄存器中
+
+（6）通过thread_resume函数恢复线程上下文，从而使其从断点处继续执行
